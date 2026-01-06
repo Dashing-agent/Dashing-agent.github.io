@@ -46,7 +46,10 @@ const GEMINI_KEY_ENV = import.meta.env.VITE_GEMINI_API_KEY;
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-const GEMINI_KEY_STORAGE = "citiinsight_gemini_key";
+// IMPORTANT for GitHub Pages + Vite base:
+const CSV_URL = `${import.meta.env.BASE_URL || "/"}trips_rows.csv`;
+
+const GEMINI_KEY_STORAGE = "dashpilot_gemini_key";
 
 function getGeminiKeyFromStorage() {
   try {
@@ -127,6 +130,108 @@ function tryParseJson(s) {
 }
 function stripCodeFences(s) {
   return String(s || "").replace(/```json|```/g, "").trim();
+}
+
+// -------------------- LOCAL QUERY ENGINE (FALLBACK) --------------------
+function normalizeOperator(op) {
+  return String(op || "").toLowerCase().trim();
+}
+function ilike(haystack, pattern) {
+  const hs = String(haystack ?? "");
+  const p = String(pattern ?? "");
+  const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const reStr = "^" + escaped.replaceAll("%", ".*") + "$";
+  try {
+    return new RegExp(reStr, "i").test(hs);
+  } catch {
+    return hs.toLowerCase().includes(p.toLowerCase().replaceAll("%", ""));
+  }
+}
+function applyLocalFilters(rows, filters) {
+  const fs = Array.isArray(filters) ? filters : filters ? [filters] : [];
+  if (!fs.length) return rows;
+
+  return rows.filter((r) => {
+    for (const f of fs) {
+      const col = f?.column;
+      const op = normalizeOperator(f?.operator);
+      const val = f?.value;
+      if (!col || !op) continue;
+
+      const cell = r?.[col];
+
+      if (op === "eq") {
+        if (cell !== val) return false;
+      } else if (op === "neq") {
+        if (cell === val) return false;
+      } else if (op === "gt") {
+        if (!(Number(cell) > Number(val))) return false;
+      } else if (op === "gte") {
+        if (!(Number(cell) >= Number(val))) return false;
+      } else if (op === "lt") {
+        if (!(Number(cell) < Number(val))) return false;
+      } else if (op === "lte") {
+        if (!(Number(cell) <= Number(val))) return false;
+      } else if (op === "ilike") {
+        if (!ilike(cell, val)) return false;
+      } else if (op === "in") {
+        const arr = Array.isArray(val)
+          ? val.map(String)
+          : typeof val === "string"
+          ? val.split(",").map((x) => x.trim())
+          : [];
+        if (!arr.includes(String(cell))) return false;
+      } else {
+        continue;
+      }
+    }
+    return true;
+  });
+}
+function applyLocalOrder(rows, orderBy) {
+  const col = orderBy?.column;
+  if (!col) return rows;
+  const asc = !!orderBy?.ascending;
+
+  const sorted = [...rows].sort((a, b) => {
+    const av = a?.[col];
+    const bv = b?.[col];
+
+    const ad = safeDate(av);
+    const bd = safeDate(bv);
+    if (ad && bd) return ad - bd;
+
+    const an = Number(av);
+    const bn = Number(bv);
+    if (!Number.isNaN(an) && !Number.isNaN(bn)) return an - bn;
+
+    return String(av ?? "").localeCompare(String(bv ?? ""));
+  });
+
+  return asc ? sorted : sorted.reverse();
+}
+function pickColumns(rows, columns) {
+  const cols = Array.isArray(columns) && columns.length ? columns : null;
+  if (!cols) return rows;
+  return rows.map((r) => {
+    const out = {};
+    for (const c of cols) out[c] = r?.[c];
+    return out;
+  });
+}
+async function executeLocalSelect(action, localAgg) {
+  if (!localAgg?.__rows?.length) return [];
+  let rows = localAgg.__rows;
+
+  rows = applyLocalFilters(rows, action.filters);
+  rows = applyLocalOrder(rows, action.orderBy);
+
+  const limit = action.limit ? clamp(Number(action.limit) || 10, 1, 500) : 50;
+  rows = rows.slice(0, limit);
+
+  rows = pickColumns(rows, action.columns);
+
+  return rows;
 }
 
 // -------------------- WIDGET CATALOG (LOCAL DASHBOARD) --------------------
@@ -576,14 +681,14 @@ export default function App() {
   // Pinned widgets shown on dashboard (added via chatbot)
   const [widgets, setWidgets] = useState([]);
 
-  // Chat state (Supabase + widget control)
+  // Chat state
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState([
     {
       role: "assistant",
       type: "text",
       content:
-        "I can: (1) query Supabase for trip rows (tables), and (2) add NEW dashboard widgets from the local CSV.\n\nType: “show widget menu” to see all charts/tables you can add.",
+        "I can: (1) query Supabase for trip rows (if configured) OR fallback to Local CSV rows, and (2) add NEW dashboard widgets from the local CSV aggregates.\n\nType: “show widget menu” to see available widgets.",
     },
   ]);
 
@@ -600,9 +705,9 @@ export default function App() {
   // -------------------- LOAD LOCAL CSV (Dashboard only) --------------------
   useEffect(() => {
     // Do NOT block local dashboard loading if Gemini is missing.
-    fetch("/trips_rows.csv")
+    fetch(CSV_URL)
       .then((res) => {
-        if (!res.ok) throw new Error("CSV file not found: put trips_rows.csv in /public");
+        if (!res.ok) throw new Error(`CSV file not found: put trips_rows.csv in /public (fetch: ${CSV_URL})`);
         return res.text();
       })
       .then((csv) => {
@@ -648,7 +753,6 @@ export default function App() {
         setError(e?.message || String(e));
         setLoading(false);
       });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // -------------------- LOCAL AGGREGATION --------------------
@@ -663,11 +767,15 @@ export default function App() {
       const durMin = (e - s) / 60000;
       if (!(durMin > 0 && durMin <= 240)) continue;
 
-      clean.push({ ...r, __started: s, __ended: e, __durMin: durMin });
+      clean.push({ ...r, __durMin: durMin });
     }
 
-    const total = clean.length;
-    const members = clean.filter((r) => String(r.member_casual).toLowerCase() === "member").length;
+    // Optional cap for GH Pages performance
+    const MAX_LOCAL_ROWS = 50000;
+    const cleanRows = clean.length > MAX_LOCAL_ROWS ? clean.slice(0, MAX_LOCAL_ROWS) : clean;
+
+    const total = cleanRows.length;
+    const members = cleanRows.filter((r) => String(r.member_casual).toLowerCase() === "member").length;
     const casual = total - members;
 
     // Hourly
@@ -675,16 +783,19 @@ export default function App() {
       name: `${String(h).padStart(2, "0")}:00`,
       value: 0,
     }));
-    for (const r of clean) {
-      const h = r.__started.getHours();
-      hourlyCounts[h].value += 1;
+    for (const r of cleanRows) {
+      const s = safeDate(r.started_at);
+      if (!s) continue;
+      hourlyCounts[s.getHours()].value += 1;
     }
 
     // DOW
     const dowCounts = Array.from({ length: 7 }, (_, i) => ({ name: DOW_SHORT[i], value: 0 }));
     const dowMC = Array.from({ length: 7 }, (_, i) => ({ name: DOW_SHORT[i], member: 0, casual: 0 }));
-    for (const r of clean) {
-      const di = dowIndex(r.__started);
+    for (const r of cleanRows) {
+      const s = safeDate(r.started_at);
+      if (!s) continue;
+      const di = dowIndex(s);
       dowCounts[di].value += 1;
       if (String(r.member_casual).toLowerCase() === "member") dowMC[di].member += 1;
       else dowMC[di].casual += 1;
@@ -692,8 +803,10 @@ export default function App() {
 
     // Month
     const monthMap = new Map();
-    for (const r of clean) {
-      const mk = monthKey(r.__started);
+    for (const r of cleanRows) {
+      const s = safeDate(r.started_at);
+      if (!s) continue;
+      const mk = monthKey(s);
       monthMap.set(mk, (monthMap.get(mk) || 0) + 1);
     }
     const tripsByMonth = Array.from(monthMap.entries())
@@ -712,8 +825,8 @@ export default function App() {
       { label: "120–240", min: 120, max: 240.0001 },
     ];
     const bucketCounts = buckets.map(() => 0);
-    for (const r of clean) {
-      const d = r.__durMin;
+    for (const r of cleanRows) {
+      const d = Number(r.__durMin);
       for (let i = 0; i < buckets.length; i++) {
         if (d >= buckets[i].min && d < buckets[i].max) {
           bucketCounts[i] += 1;
@@ -725,7 +838,7 @@ export default function App() {
 
     // Rideable split
     const rideableMap = new Map();
-    for (const r of clean) {
+    for (const r of cleanRows) {
       const rt = String(r.rideable_type || "unknown").trim() || "unknown";
       rideableMap.set(rt, (rideableMap.get(rt) || 0) + 1);
     }
@@ -735,7 +848,7 @@ export default function App() {
 
     // Top stations
     const stationMap = new Map();
-    for (const r of clean) {
+    for (const r of cleanRows) {
       const s = String(r.start_station_name || "Unknown").trim() || "Unknown";
       stationMap.set(s, (stationMap.get(s) || 0) + 1);
     }
@@ -746,7 +859,7 @@ export default function App() {
 
     // Top routes
     const routeMap = new Map();
-    for (const r of clean) {
+    for (const r of cleanRows) {
       const s = String(r.start_station_name || "Unknown").trim() || "Unknown";
       const e = String(r.end_station_name || "Unknown").trim() || "Unknown";
       const k = `${s} → ${e}`;
@@ -758,7 +871,7 @@ export default function App() {
       .map(([fullName, value]) => ({ fullName, value, name: shortText(fullName, 26) }));
 
     // Avg duration
-    const avgDur = total ? clean.reduce((acc, r) => acc + r.__durMin, 0) / total : 0;
+    const avgDur = total ? cleanRows.reduce((acc, r) => acc + Number(r.__durMin || 0), 0) / total : 0;
 
     // Peak hour
     let peakHourIdx = 0;
@@ -769,8 +882,8 @@ export default function App() {
     for (let i = 1; i < 7; i++) if (dowCounts[i].value > dowCounts[busiestIdx].value) busiestIdx = i;
 
     // Latest trips (local)
-    const latestTrips = [...clean]
-      .sort((a, b) => b.__started - a.__started)
+    const latestTrips = [...cleanRows]
+      .sort((a, b) => (safeDate(b.started_at)?.getTime() || 0) - (safeDate(a.started_at)?.getTime() || 0))
       .slice(0, 12)
       .map((r) => ({
         started_at: r.started_at,
@@ -781,6 +894,8 @@ export default function App() {
       }));
 
     return {
+      __rows: cleanRows, // <- NEW: store rows for local fallback queries
+
       cleanCount: total,
       members,
       casual,
@@ -945,47 +1060,53 @@ export default function App() {
       }));
 
       const prompt = `
-You are an agent that can:
-(A) Query Supabase for rows (tables)
-(B) Preview or add NEW widgets to the dashboard (from local CSV aggregates)
+You are DashPilot AI Agent.
+
+You can:
+(A) Preview or add NEW widgets to the dashboard (from local CSV aggregates)
+(B) Query tabular trip rows.
+  - Prefer Supabase when configured.
+  - If Supabase is not configured, query Local CSV rows.
 
 Return ONLY JSON or plain text. No markdown.
 
-Local Widget Catalog (these can be added to dashboard):
+Local Widget Catalog:
 ${JSON.stringify(widgetList)}
 
-Actions you may return:
+Tools you may return:
 
-1) Add a widget to dashboard:
+1) Add a widget:
 { "tool": "add_widget", "widgetId": "w_trips_by_month" }
 
-2) Preview a widget in chat:
+2) Preview a widget:
 { "tool": "preview_widget", "widgetId": "w_trips_by_month" }
 
 3) Show widget menu:
 { "tool": "show_menu" }
 
-4) Supabase select query (tables). Use table="trips" by default.
-You can provide:
-- columns: ["ride_id","started_at","start_station_name",...]
-- filters: one or array of {column, operator, value}
-- orderBy: {column, ascending}
-- limit: number
-
-Example:
+4) Query Supabase (if available):
 {
   "tool": "supabase",
   "table": "trips",
   "action": "select",
   "columns": ["started_at","start_station_name","member_casual"],
-  "filters": [
-    {"column":"start_station_name","operator":"ilike","value":"%Grove%"}
-  ],
+  "filters": [{"column":"start_station_name","operator":"ilike","value":"%Grove%"}],
+  "orderBy": {"column":"started_at","ascending": false},
+  "limit": 10
+}
+
+5) Query Local CSV rows (fallback):
+{
+  "tool": "local_select",
+  "action": "select",
+  "columns": ["started_at","start_station_name","member_casual"],
+  "filters": [{"column":"start_station_name","operator":"ilike","value":"%Grove%"}],
   "orderBy": {"column":"started_at","ascending": false},
   "limit": 10
 }
 
 If user asks for "latest trips", use orderBy started_at desc and a limit.
+If Supabase is not configured, DO NOT return tool="supabase"; return tool="local_select".
 
 User request:
 "${q}"
@@ -1021,10 +1142,10 @@ User request:
         return;
       }
 
-      if (asJson.tool === "supabase" && asJson.action === "select") {
-        setMessages((prev) => [...prev, { role: "assistant", type: "text", content: "Querying Supabase…" }]);
+      if (asJson.tool === "local_select" && asJson.action === "select") {
+        setMessages((prev) => [...prev, { role: "assistant", type: "text", content: "Querying local CSV…" }]);
 
-        const data = await executeSupabaseAction(asJson);
+        const data = await executeLocalSelect(asJson, local);
 
         setMessages((prev) => [
           ...prev,
@@ -1032,8 +1153,8 @@ User request:
             role: "assistant",
             type: "table",
             content: {
-              title: `Supabase results (${data.length} rows)`,
-              source: "supabase",
+              title: `Local CSV results (${data.length} rows)`,
+              source: "local",
               payload: {
                 columns: asJson.columns?.map((c) => ({ key: c, label: c })) || null,
                 rows: data,
@@ -1042,6 +1163,64 @@ User request:
           },
         ]);
         return;
+      }
+
+      if (asJson.tool === "supabase" && asJson.action === "select") {
+        setMessages((prev) => [...prev, { role: "assistant", type: "text", content: "Querying rows…" }]);
+
+        try {
+          const data = await executeSupabaseAction(asJson);
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              type: "table",
+              content: {
+                title: `Supabase results (${data.length} rows)`,
+                source: "supabase",
+                payload: {
+                  columns: asJson.columns?.map((c) => ({ key: c, label: c })) || null,
+                  rows: data,
+                },
+              },
+            },
+          ]);
+          return;
+        } catch (e) {
+          // Automatic fallback to local
+          const localAction = {
+            tool: "local_select",
+            action: "select",
+            columns: asJson.columns,
+            filters: asJson.filters,
+            orderBy: asJson.orderBy,
+            limit: asJson.limit,
+          };
+          const data = await executeLocalSelect(localAction, local);
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              type: "table",
+              content: {
+                title: `Fallback to Local CSV (${data.length} rows)`,
+                source: "local",
+                payload: {
+                  columns: localAction.columns?.map((c) => ({ key: c, label: c })) || null,
+                  rows: data,
+                },
+              },
+            },
+            {
+              role: "assistant",
+              type: "text",
+              content: `Supabase unavailable: ${e?.message || String(e)}. Used local CSV instead.`,
+            },
+          ]);
+          return;
+        }
       }
 
       setMessages((prev) => [...prev, { role: "assistant", type: "text", content: cleaned }]);
@@ -1277,8 +1456,7 @@ User request:
             </div>
 
             <div style={{ marginTop: 10, color: THEME.muted, fontSize: 13, lineHeight: 1.35 }}>
-              Stored in <code>localStorage</code> on this device only. In a public deployment, users can bring their own
-              key.
+              Stored in <code>localStorage</code> on this device only. In a public deployment, users can bring their own key.
             </div>
 
             <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -1386,9 +1564,9 @@ User request:
               <Bike size={22} color={THEME.accent} />
             </div>
             <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 16, fontWeight: 1000, letterSpacing: 0.2 }}>CitiInsight</div>
+              <div style={{ fontSize: 16, fontWeight: 1000, letterSpacing: 0.2 }}>DashPilot</div>
               <div style={{ fontSize: 12, color: THEME.muted, marginTop: 3 }}>
-                Local dashboard + Supabase analyst
+                Local CSV dashboard + agentic analyst
               </div>
             </div>
           </div>
@@ -1448,7 +1626,7 @@ User request:
                     }}
                   />
                   <div style={{ fontSize: 13, color: THEME.text }}>
-                    Supabase: <span style={{ color: THEME.muted }}>{supabase ? "Connected" : "Missing config"}</span>
+                    Supabase: <span style={{ color: THEME.muted }}>{supabase ? "Connected" : "Not configured"}</span>
                   </div>
                 </div>
 
@@ -1469,18 +1647,17 @@ User request:
               </div>
 
               <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <IconButton title={canUseAI ? "Update Gemini key" : "Add Gemini key"} tone="accent" onClick={() => setShowKeyModal(true)}>
+                <IconButton
+                  title={canUseAI ? "Update Gemini key" : "Add Gemini key"}
+                  tone="accent"
+                  onClick={() => setShowKeyModal(true)}
+                >
                   <Sparkles size={16} />
                   {canUseAI ? "Update Key" : "Add Key"}
                 </IconButton>
 
-                <IconButton title="Open widget menu in analyst chat" tone="accent" onClick={() => setActiveTab("analyst")}>
-                  <Sparkles size={16} />
-                  Add Widgets
-                </IconButton>
-
                 <IconButton
-                  title="Show widget catalog message"
+                  title="Show widget catalog in chat"
                   onClick={() => {
                     setActiveTab("analyst");
                     pushWidgetMenuMessage();
@@ -1489,6 +1666,10 @@ User request:
                   <PlusCircle size={16} />
                   Catalog
                 </IconButton>
+              </div>
+
+              <div style={{ marginTop: 10, color: THEME.muted, fontSize: 12, lineHeight: 1.3 }}>
+                CSV source: <code>{CSV_URL}</code>
               </div>
             </div>
           </div>
@@ -1557,8 +1738,10 @@ User request:
                   <div style={{ marginTop: 10, color: THEME.muted, fontSize: 13 }}>
                     Ensure:
                     <ul style={{ margin: "8px 0 0 18px" }}>
-                      <li><code>public/trips_rows.csv</code> exists</li>
-                      <li>Gemini key is set (optional for dashboard; required for AI Analyst)</li>
+                      <li>
+                        <code>public/trips_rows.csv</code> exists (and is deployed)
+                      </li>
+                      <li>Gemini key is set (optional for dashboard; required for AI Analyst actions)</li>
                       <li>Supabase env keys exist if you want DB queries</li>
                     </ul>
                   </div>
@@ -1637,22 +1820,18 @@ User request:
                   }}
                 >
                   {(baseCharts || []).map((c, i) => (
-                    <Panel
-                      key={i}
-                      title={c.title}
-                      right={<span style={{ color: THEME.muted, fontSize: 12 }}>Source: Local CSV</span>}
-                    >
+                    <Panel key={i} title={c.title} right={<span style={{ color: THEME.muted, fontSize: 12 }}>Source: Local CSV</span>}>
                       <ChartRenderer config={c.payload} />
                     </Panel>
                   ))}
                 </div>
 
-                {/* PINNED WIDGETS (from chatbot) */}
+                {/* PINNED WIDGETS */}
                 <div style={{ marginTop: 18 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
                     <div style={{ fontSize: 18, fontWeight: 1000, display: "flex", alignItems: "center", gap: 10 }}>
                       <Pin size={18} color={THEME.accent} />
-                      Pinned Widgets (Added via Chat)
+                      Pinned Widgets
                     </div>
                     <div style={{ color: THEME.muted, fontSize: 12 }}>
                       {widgets.length ? `${widgets.length} pinned` : "No pinned widgets yet"}
@@ -1683,11 +1862,7 @@ User request:
                             </div>
                           }
                         >
-                          {w.kind === "chart" ? (
-                            <ChartRenderer config={w.payload} />
-                          ) : (
-                            <TableRenderer columns={w.payload?.columns} rows={w.payload?.rows} />
-                          )}
+                          {w.kind === "chart" ? <ChartRenderer config={w.payload} /> : <TableRenderer columns={w.payload?.columns} rows={w.payload?.rows} />}
                         </Panel>
                       ))}
                     </div>
@@ -1747,29 +1922,29 @@ User request:
                         {canUseAI ? "Update Key" : "Add Key"}
                       </IconButton>
 
-                      <IconButton title="Example: latest trips (Supabase)" onClick={() => setInput("Show latest 10 trips")}>
+                      <IconButton title="Example: latest trips" onClick={() => setInput("Show latest 10 trips")}>
                         <Database size={16} />
-                        Latest DB Trips
+                        Latest Trips
                       </IconButton>
 
                       <IconButton
-                        title="Example: station search (Supabase)"
+                        title="Example: station search"
                         onClick={() => setInput("Find trips where start station contains Grove")}
                       >
                         <Table2 size={16} />
-                        Search DB
+                        Search
                       </IconButton>
                     </div>
                   </div>
 
                   <div style={{ marginTop: 10, color: THEME.muted, fontSize: 13, lineHeight: 1.35 }}>
-                    Use this chat to:
+                    This chat can:
                     <ul style={{ margin: "8px 0 0 18px" }}>
                       <li>
-                        <b>Supabase tables</b>: “Show latest 10 trips”, “Find trips where start station contains Grove”.
+                        Query <b>Supabase</b> when configured, otherwise fallback to <b>Local CSV</b>.
                       </li>
                       <li>
-                        <b>Dashboard widgets</b>: “Show widget menu”, then click <b>Add</b> (pins to dashboard).
+                        Add/preview <b>Dashboard widgets</b>: “show widget menu”.
                       </li>
                     </ul>
                     {!canUseAI ? (
@@ -1780,7 +1955,7 @@ User request:
                   </div>
                 </div>
 
-                {/* CHAT SCROLLER */}
+                {/* CHAT */}
                 <div style={{ flex: 1, overflowY: "auto", paddingRight: 6, paddingBottom: 6 }}>
                   {messages.map((m, i) => renderChatMessage(m, i))}
                   <div ref={chatEndRef} />
@@ -1823,8 +1998,7 @@ User request:
 
                   {!supabase ? (
                     <div style={{ marginTop: 10, color: THEME.warn, fontSize: 12 }}>
-                      Supabase keys missing: DB queries will fail until <code>VITE_SUPABASE_URL</code> and{" "}
-                      <code>VITE_SUPABASE_ANON_KEY</code> are set.
+                      Supabase not configured: DB queries will fallback to local CSV.
                     </div>
                   ) : null}
                 </div>
